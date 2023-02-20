@@ -18,10 +18,13 @@
     - Pololu 5V 600mA Step-Down Voltage Regulator D36V6F5
     - Pololu 12V 600mA Step-Down Voltage Regulator D36V6F5
     - SanDisk Industrial XI 8 GB microSD card
+    - Adafruit LoRa Radio Featherwing https://www.adafruit.com/product/3231
 
     Sensors:
     - RM Young 05103L Wind Monitor
     - Vaisala HMP60 Humidity and Temperature Probe
+    - MaxBotix MB7374 HRXL-MaxSonar-WRST7 Ultrasonic Precision Range Finder https://www.maxbotix.com/Ultrasonic_Sensors/MB7374.htm
+
 
     Comments:
     - Sketch uses 98720 bytes (37%) of program storage space. Maximum is 262144 bytes.
@@ -46,6 +49,8 @@
 #include <TinyGPS++.h>              // https://github.com/mikalhart/TinyGPSPlus (v1.0.3)
 #include <Wire.h>                   // https://www.arduino.cc/en/Reference/Wire
 #include <wiring_private.h>         // Required for creating new Serial instance
+#include <RH_RF95.h>                // https://github.com/PaulStoffregen/RadioHead
+#include <RHReliableDatagram.h>     // https://github.com/PaulStoffregen/RadioHead
 
 // ----------------------------------------------------------------------------
 // Define unique identifier
@@ -56,6 +61,18 @@
 // Data logging
 // ----------------------------------------------------------------------------
 #define LOGGING         true  // Log data to microSD
+
+// ----------------------------------------------------------------------------
+// LoRa communication
+// ----------------------------------------------------------------------------
+//#define LORA            true  // Send/receive data by LoRa radio
+#define BASE            true  // Define whether the station is a base or a node
+                              // in a LoRa network (false for a node)
+
+// ----------------------------------------------------------------------------
+// Iridium communication
+// ----------------------------------------------------------------------------
+#define IRIDIUM           true  // Send/receive data by Iridium
 
 // ----------------------------------------------------------------------------
 // Debugging macros
@@ -102,6 +119,9 @@
 #define PIN_IRIDIUM_SLEEP   12  // Pin 7 OnOff (Grey)
 #define PIN_LED_RED         13
 
+#define PIN_MB_pw           5   // Maxbotix pulseWidth pin
+#define PIN_MB_sleep        11  // Maxbotix sleep pin
+
 // Unused
 #define PIN_SOLAR           7
 #define PIN_SENSOR_PWR      7
@@ -138,6 +158,9 @@ FsFile                          logFile;      // Log file
 TinyGPSPlus                     gnss;
 sensirion                       sht(20, 21);  // (data, clock). Pull-up required on data pin
 
+#define RF95_FREQ 915.0                              // Define LoRa frequency
+RH_RF95 rf95(PIN_RFM95_CS, PIN_RFM95_INT);           // Singleton instance of the radio driver
+
 // Custom TinyGPS objects to store fix and validity information
 // Note: $GPGGA and $GPRMC sentences produced by GPS receivers (PA6H module)
 // $GNGGA and $GNRMC sentences produced by GPS/GLONASS receivers (PA161D module)
@@ -157,6 +180,11 @@ Statistic solarStats;           // Solar radiation
 Statistic windSpeedStats;       // Wind speed
 Statistic uStats;               // Wind east-west wind vector component (u)
 Statistic vStats;               // Wind north-south wind vector component (v)
+Statistic MaxbotixStats_av;     // Maxbotix average distances
+Statistic MaxbotixStats_std;    // Maxbotix std distances
+Statistic MaxbotixStats_max;    // Maxbotix max distances
+Statistic MaxbotixStats_min;    // Maxbotix min distances
+Statistic MaxbotixStats_nan;    // Maxbotix nan samples
 
 // ----------------------------------------------------------------------------
 // User defined global variable declarations
@@ -165,12 +193,31 @@ unsigned long sampleInterval    = 5;      // Sampling interval (minutes). Defaul
 unsigned int  averageInterval   = 12;     // Number of samples to be averaged in each message. Default: 12 (hourly)
 unsigned int  transmitInterval  = 1;      // Number of messages in each Iridium transmission (340-byte limit)
 unsigned int  retransmitLimit   = 2;      // Failed data transmission reattempts (340-byte limit)
-unsigned int  gnssTimeout       = 5;    // Timeout for GNSS signal acquisition (seconds)
-unsigned int  iridiumTimeout    = 5;    // Timeout for Iridium transmission (seconds)
+unsigned int  gnssTimeout       = 5;      // Timeout for GNSS signal acquisition (seconds)
+unsigned int  iridiumTimeout    = 5;      // Timeout for Iridium transmission (seconds)
 unsigned int  iridiumStartup    = 5;      // Timeout for Iridium startup (seconds)
 bool          firstTimeFlag     = true;   // Flag to determine if program is running for the first time
 float         batteryCutoff     = 0.0;    // Battery voltage cutoff threshold (V)
 byte          loggingMode       = 1;      // Flag for new log file creation. 1: daily, 2: monthly, 3: yearly
+unsigned int  node_number       = 1;      // Address of current station in LoRa network (same as CRYOLOGGER_ID?) 
+unsigned int  base_station_number = 3;    // Address of base station in LoRa network (use #if BASE?)
+unsigned int  total_nodes       = 3;      // Number of stations in LoRa network
+unsigned int  listen            = 30;     // Time in seconds to listen for incoming or sending outgoing LoRa messages
+
+// ----------------------------------------------------------------------------
+// LoRa reliable datagram set-up
+// ----------------------------------------------------------------------------
+
+#define NODE_ADDRESS  node_number          // Node number is local LoRa address
+#define BASE_ADDRESS  base_station_number  // Number of station that is LoRa base station w/ RockBlock
+
+#if BASE
+RHReliableDatagram manager(rf95, NODE_ADDRESS);  // Class to manage message delivery and receipt, using the driver declared above
+
+#else
+RHReliableDatagram manager(rf95, BASE_ADDRESS);  // Class to manage message delivery and receipt, using the driver declared above
+
+#endif
 
 // ----------------------------------------------------------------------------
 // Global variable declarations
@@ -219,6 +266,23 @@ byte          satellites        = 0;      // GNSS satellites
 float         hdop              = 0.0;    // GNSS HDOP
 tmElements_t  tm;                         // Variable for converting time elements to time_t
 
+unsigned int  distMaxbotix_av   = 0;      // Average distance from Maxbotix sensor to surface (mm)
+unsigned int  distMaxbotix_std  = 0;      // Std distance from Maxbotix sensor to surface (mm)
+unsigned int  distMaxbotix_max  = 0;      // Max distance from Maxbotix sensor to surface (mm)
+unsigned int  distMaxbotix_min  = 0;      // Min distance from Maxbotix sensor to surface (mm)
+unsigned int  distMaxbotix_nan  = 0;      // Number of NaN readings in Maxbotix
+
+int16_t       packetnum;                  // LoRa radio packet number
+uint8_t       buf[RH_RF95_MAX_MESSAGE_LEN];      // LoRa radio buffer
+uint8_t       len               = sizeof(buf);   // LoRa radio buffer length
+volatile bool resFlag           = false;         // LoRa response flag is set to true once response is found
+
+uint32_t      period            = listen*1000UL; // Set up LoRa send/receive listening time
+
+#if BASE
+uint8_t rx_reply[] = "ok";
+#endif
+
 // ----------------------------------------------------------------------------
 // Unions/structures
 // ----------------------------------------------------------------------------
@@ -234,13 +298,13 @@ typedef union
     uint16_t  pressureInt;        // Internal pressure (hPa)        (2 bytes)   - 850 * 100
     int16_t   temperatureExt;     // External temperature (°C)      (2 bytes)   * 100
     uint16_t  humidityExt;        // External humidity (%)          (2 bytes)   * 10
-    int16_t   pitch;              // Pitch (°)                      (2 bytes)   * 100
-    int16_t   roll;               // Roll (°)                       (2 bytes)   * 100
+    //int16_t   pitch;              // Pitch (°)                      (2 bytes)   * 100
+    //int16_t   roll;               // Roll (°)                       (2 bytes)   * 100
     //uint16_t  solar;              // Solar irradiance (W m-2)       (2 bytes)   * 100
-    uint16_t  windSpeed;          // Mean wind speed (m/s)          (2 bytes)   * 100
-    uint16_t  windDirection;      // Mean wind direction (°)        (2 bytes)
-    uint16_t  windGustSpeed;      // Wind gust speed (m/s)          (2 bytes)   * 100
-    uint16_t  windGustDirection;  // Wind gust direction (°)        (2 bytes)
+    //uint16_t  windSpeed;          // Mean wind speed (m/s)          (2 bytes)   * 100
+    //uint16_t  windDirection;      // Mean wind direction (°)        (2 bytes)
+    //uint16_t  windGustSpeed;      // Wind gust speed (m/s)          (2 bytes)   * 100
+    //uint16_t  windGustDirection;  // Wind gust direction (°)        (2 bytes)
     //int32_t   latitude;           // Latitude (DD)                  (4 bytes)   * 1000000
     //int32_t   longitude;          // Longitude (DD)                 (4 bytes)   * 1000000
     //uint8_t   satellites;         // # of satellites                (1 byte)
@@ -249,8 +313,13 @@ typedef union
     uint16_t  transmitDuration;   // Previous transmission duration (2 bytes)
     uint8_t   transmitStatus;     // Iridium return code            (1 byte)
     uint16_t  iterationCounter;   // Message counter                (2 bytes)
-  } __attribute__((packed));                                    // Total: (33 bytes)
-  uint8_t bytes[33];
+    uint16_t  distMaxbotix_av;      // Distance from Maxbotix to surface (mm)   (2 bytes)
+    uint16_t  distMaxbotix_std;     // Std from Maxbotix to surface (mm)        (2 bytes)
+    uint16_t  distMaxbotix_max;     // Max from Maxbotix to surface (mm)        (2 bytes)
+    uint16_t  distMaxbotix_min;     // Min from Maxbotix to surface (mm)        (2 bytes)
+    uint16_t  distMaxbotix_nan;     // Number of Maxbotix nans                  (2 bytes)
+  } __attribute__((packed));                                    // Total: (31 bytes)
+  uint8_t bytes[31];
 } SBD_MO_MESSAGE;
 
 SBD_MO_MESSAGE moSbdMessage;
@@ -312,12 +381,16 @@ void setup()
   pinMode(PIN_12V_EN, OUTPUT);
   pinMode(PIN_GNSS_EN, OUTPUT);
   pinMode(PIN_VBAT, INPUT);
+  pinMode(PIN_RFM95_RST, OUTPUT);
+  pinMode(MB_pwPin INPUT);, 
+  pinMode(MB_sleepPin, OUTPUT);
   digitalWrite(PIN_LED_GREEN, LOW);   // Disable green LED
   digitalWrite(PIN_LED_RED, LOW);     // Disable red LED
   digitalWrite(PIN_SENSOR_PWR, LOW);  // Disable power to 3.3V
   digitalWrite(PIN_5V_EN, LOW);       // Disable power to Iridium 9603
   digitalWrite(PIN_12V_EN, LOW);      // Disable 12V power
   digitalWrite(PIN_GNSS_EN, HIGH);    // Disable power to GNSS
+  digitalWrite(PIN_RFM95_RST, HIGH);   // Disable LoRa?
 
   // Configure analog-to-digital (ADC) converter
   configureAdc();
@@ -349,6 +422,7 @@ void setup()
   readGnss();           // Sync RTC with GNSS
   configureIridium();   // Configure Iridium 9603 transceiver
   createLogFile();      // Create initial log file
+  LoRa_setup();         // Configure LoRa
 
 #if CALIBRATE
   enable5V();   // Enable 5V power
@@ -451,6 +525,7 @@ void loop()
       //read7911();       // Read anemometer
       readHmp60();      // Read temperature/relative humidity sensor
       read5103L();      // Read anemometer
+      readMxBtx();      // Read Maxbotix Distance sensor
       disable12V();     // Disable 12V power
       disable5V();      // Disable 5V power
 
@@ -466,6 +541,37 @@ void loop()
         // Check if data transmission interval has been reached
         if ((transmitCounter == transmitInterval) || firstTimeFlag)
         {
+          #if BASE
+          // Start timed loop to receive messages
+          DEBUG_PRINT("Listening for messages for "); Serial.print(listen);
+          DEBUG_PRINTLN(" seconds");
+            
+          uint32_t tStart = millis();
+          uint32_t tEnd = tStart;
+          while ((tEnd - tStart) <= period){
+                LoRa_receive(); // Listening function
+                petDog();
+                tEnd = millis();
+          }
+          
+          // Sleep the radio when done
+          rf95.sleep();
+
+          #else
+          uint32_t tStart = millis();
+          uint32_t tEnd = tStart;
+          while ((tEnd - tStart) <= period){
+            LoRa_send();
+            petDog(); // Pet dog after each attempt to send
+                // Exit loop if acknowledgement of receipt is received
+            if (loraRxFlag == true) {
+              break;
+            }
+            tEnd = millis();
+          }
+          
+          #endif
+          
           readGnss();       // Sync RTC with the GNSS
           transmitData();   // Transmit data via Iridium transceiver
         }

@@ -491,7 +491,94 @@ void windVectors()
 //
 // ----------------------------------------------------------------------------
 // Read Maxbotix distance to surface
-void readMb7354()
-{
+void readMxBtx() {
+  // Wake sensor
+  digitalWrite(MB_sleepPin, HIGH);
+  delay(100);
+  
+  // Create a temporary Statistic array to hold the maxbotix measurements
+  Statistic Maxbotix;
 
+  // Create temporary variables
+  unsigned int z, z_av, z_std, z_max, z_min, z_nan;
+  z = 9999;
+  z_av = 0;
+  z_std = 0;
+  z_max = 0;
+  z_min = 0;
+  z_nan = 0;
+  
+  // Get 30 z readings in mm, filtering out reading 50 mm
+  // above/below sensor minumum/maximum readings
+  for(byte i = 0; i < 30; i++) {
+
+    // Get timer flags in case of disconnected sensor and a measurement flag
+    uint32_t mxbtxStart = millis(); // Start time for 1 MaxBotix read attempt
+    uint32_t mxbtxEnd = mxbtxStart; // End time for 1 MaxBotix read attempt
+    uint32_t mxbtxPeriod = 1000; // Max time in milliseconds for 1 MaxBotix read attempt
+    
+    while ((mxbtxEnd - mxbtxStart) <= mxbtxPeriod){ // Try a read attempt
+      uint32_t mxbtxTimeOut = 5000; // Timeout in mS if no MaxBotix pulse is read
+      z = pulseIn(MB_pwPin, HIGH); // Read distance to snow surface
+      if (z > 550 && z < 4950) { // Filter readings
+        Maxbotix.add(z); // Add good readings to stats array
+        break;
+      }
+      else if (z = 0) {
+        z = 9999; // Return a NaN number to indicate a detached sensor
+        Maxbotix.add(z); // Add NaN readings to stats array
+      }
+      else {
+        z_nan += 1; // Count bad readings
+        break;
+      }
+    }
+    Serial.println(z);
+    delay(100); // Delay 0.1 secs between readings
+  }
+
+  // Get stats from the Maxbotix array
+  z_av = Maxbotix.average(), 0;
+  z_std = Maxbotix.pop_stdev(), 0;
+  z_max = Maxbotix.maximum(), 0;
+  z_min = Maxbotix.minimum(), 0;
+    
+  // Deal with issue of a maximum long number in the instance of no
+  // readings within filtered range
+  if (z_av > 5000) {
+    z_av = 0;
+  }
+  if (z_std > 5000) {
+    z_std = 0;
+  }
+  if (z_max > 5000) {
+  z_max = 0;
+  }
+  if (z_min > 5000) {
+  z_min = 0;
+  }
+  
+  // Add sample stats to global arrays
+  MaxbotixStats_av.add(z_av);
+  MaxbotixStats_std.add(z_std);
+  MaxbotixStats_max.add(z_max);
+  MaxbotixStats_min.add(z_min);
+  MaxbotixStats_nan.add(z_nan);
+
+  // Add to sample variables
+  distMaxbotix_av  = z_av;
+  distMaxbotix_std = z_std;
+  distMaxbotix_max = z_max;
+  distMaxbotix_min = z_min;
+  distMaxbotix_nan = z_nan;
+
+  // Clear local array
+  Maxbotix.clear();
+
+  Serial.print("Distance: "); Serial.print(z_av); Serial.println(" mm");
+  
+  // Sleep sensor
+  digitalWrite(MB_sleepPin, LOW);
+  delay(100);
+  
 }
